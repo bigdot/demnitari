@@ -41,9 +41,9 @@ demnitari (cron zilnic în Actions):
 
 ### Surse (scrape zilnic)
 
-- **Deputați:** cdep.ro — lista deputaților legislaturii curente, cu circumscripția
-  (județul), partidul/grupul, link profil oficial, foto.
-- **Senatori:** senat.ro — echivalent.
+- **cdep.ro** — ambele camere (platforma "Parlamentul României"): liste pe
+  circumscripții + profiluri + CV-uri, pentru deputați (`cam=2`) și senatori (`cam=1`).
+- **senat.ro** — doar Biografia senatorilor (contact suplimentar: telefon, birouri).
 - Circumscripții: 41 județe + București (42) + Diaspora (43).
 
 ### Output (`site/data/`)
@@ -54,18 +54,60 @@ demnitari (cron zilnic în Actions):
   ~13k intrări, plus forme fără diacritice precalculate pentru căutare.
   București: sectoarele apar ca intrări (toate duc la circumscripția B).
   Diaspora: o intrare specială ("Diaspora / în afara țării" → DIA).
-- `parlamentari/<COD>.json` — per circumscripție (ex: `CJ.json`, `B.json`, `DIA.json`):
+- `parlamentari/<COD>.json` — per circumscripție (ex: `CJ.json`, `B.json`, `DIA.json`).
+  Deputații și senatorii au ACEEAȘI schemă:
   ```json
   {
     "circumscriptie": {"cod": "CJ", "nume": "Cluj", "nr": 13},
     "actualizat": "2026-09-16",
-    "deputati": [{"nume": "...", "partid": "...", "grup": "...",
-                   "email": "...", "url_profil": "...", "foto": "..."}],
-    "senatori": [ ... la fel ... ]
+    "deputati": [ <parlamentar> ],
+    "senatori":  [ <parlamentar> ]
   }
   ```
-  Contact = ce publică oficial cdep.ro/senat.ro pe profil (email; unde există,
-  biroul parlamentar). Câmpurile lipsă rămân null — nu inventăm date.
+  Schema `<parlamentar>`:
+  ```json
+  {
+    "nume": "FIFOR",
+    "prenume": "Mihai-Viorel",
+    "afiliat": true,
+    "grup_parlamentar": "PSD",
+    "grupuri_parlamentare_precedente": {"2024-12_2026-06": "SOS România"},
+    "partid": "Partidul Social Democrat",
+    "partide_precedente": {"2024-12_2026-06": "Partidul S.O.S. România"},
+    "foto": "https://www.cdep.ro/parlamentari/l2024/....JPG",
+    "profil_url": "https://www.cdep.ro/ords/pls/parlam/structura2015.mp?idm=...",
+    "cv_url": "string | null (doar cine are CV publicat)",
+    "contact_parlamentar": {
+      "email": "...@cdep.ro sau ...@senat.ro | null",
+      "birou": ["adresele birourilor parlamentare din teritoriu"]
+    },
+    "alte_contacte": {
+      "telefon": "... | absent",
+      "email": "email personal din CV | absent",
+      "facebook": "... | absent",
+      "site": "... | absent"
+    }
+  }
+  ```
+  Convenții: perioadele istoricului normalizate `YYYY-MM_YYYY-MM` (luna românească
+  "iun. 2026" → "2026-06"); `afiliat` = grupul curent nu e "Neafiliați"; câmpurile
+  fără date rămân null / absente — nu inventăm date.
+
+### Surse per câmp (rezumat; detaliile de parsare = comentarii în cod)
+
+  Ambele camere au liste + profiluri pe cdep.ro (`cam=2` deputați, `cam=1` senatori):
+  - **Lista pe circumscripții** (`structura2015.de?leg=...&par=C[&cam=1]`, 1 req/cameră):
+    gruparea pe circumscripții, nume, grup curent, email @cdep.ro (doar deputați),
+    linkuri sociale, profil_url.
+  - **Profilul cdep.ro** (1 req/parlamentar): nume/prenume (majuscule = nume de
+    familie), partid + grup cu istoric și perioade, foto, birouri (deputați),
+    cv_url (butonul CV apare doar la cine are CV).
+  - **CV-ul cdep.ro** (1 req/parlamentar cu CV): email personal + alte contacte.
+  - **Biografia senat.ro** (2 req/senator: GET fișă + POST postback "Biografie"):
+    email @senat.ro, telefon, "Contact în teritoriu" (birouri) — doar senatori.
+    Maparea cdep.ro ↔ senat.ro se face pe nume normalizat, validată 1:1 la build.
+
+  Buget total: ~1000 requesturi/zi la 1 req/sec ≈ 17 min de CI.
 - Snapshot-urile HTML brute NU se comit în v1 (zgomot); doar JSON-urile derivate.
 
 ### Reguli de robustețe
