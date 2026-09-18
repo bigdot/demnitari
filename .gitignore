@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Node / frontend build
+node_modules/
+site/dist/
+
+# scratch + scrape run state (receipt) — ephemeral, generated in-workspace
+tmp/
+run/
+
+# generated data (scraped in CI + built into the Pages artifact; not versioned)
+site/data/
