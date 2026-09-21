@@ -60,7 +60,7 @@ SCHEMA = """{
   "partid": "<partidul CURENT, forma scurta (PSD, POT, PUSL...); null daca a plecat din partid si nu a intrat in altul (slotul de partid arata un nume de GRUP)>",
   "partid_mandat": "<partidul cu care si-a castigat mandatul, forma scurta — recordul are deja o valoare, scurteaz-o la abreviere (Partidul Oamenilor Tineri -> POT)>",
   "contacts": {
-    "official_email": "<email oficial: @cdep.ro pentru deputat (id 2:…), @senat.ro pentru senator (id 1:…); altfel null>",
+    "official_email": "<email oficial: @cdep.ro pentru deputat (id 2:…), @senat.ro pentru senator (id 1:…). DOAR daca adresa apare scrisa in datele primite — NU o construi din nume; altfel null>",
     "other_emails": ["<email personal non-institutional (@yahoo, @gmail...)>"],
     "offices": ["<adresa unui birou parlamentar teritorial, text curat, fara emoji>"],
     "numbers": ["<numar de telefon de contact, doar cifre si separatori>"],
@@ -143,11 +143,15 @@ def _prompt_batch(membri: list[dict]) -> str:
     )
 
 
-def _valideaza(brut: dict, record: dict | None = None, uid: str | None = None) -> dict:
+def _valideaza(brut: dict, record: dict | None = None, uid: str | None = None,
+               sursa: str = "") -> dict:
     """Keep only well-formed values — the model proposes, we verify.
 
     `record` is the mechanical record; used to guard the surname (the LLM may
-    strip a title but must not invent a different family name).
+    strip a title but must not invent a different family name). `sursa` is
+    everything the model was given about this member (record + profile text +
+    CV data): an official address is admitted only if it is written in there —
+    the model builds `prenume.nume@cdep.ro` from the name when it finds none.
     """
     record = record or {}
     out: dict = {}
@@ -185,8 +189,16 @@ def _valideaza(brut: dict, record: dict | None = None, uid: str | None = None) -
         # emailuri: fiecare adresa propusa de model e validata inainte sa intre
         # intr-un camp (oficial = doar domeniul camerei membrului)
         altele = c.get("other_emails") if isinstance(c.get("other_emails"), list) else []
+        candidati = []
+        for email in (c.get("official_email"), *altele):
+            if (emailuri.valideaza(email, uid) == "oficial"
+                    and email.strip().lower() not in sursa.lower()):
+                log.warning("LLM: email oficial care nu apare in datele membrului, "
+                            "neadmis: %r (%s %s)", email, uid, record.get("nume", ""))
+                continue
+            candidati.append(email)
         contacts["official_email"], contacts["other_emails"] = emailuri.admite(
-            [c.get("official_email"), *altele], uid, cine=record.get("nume", ""))
+            candidati, uid, cine=record.get("nume", ""))
         contacts["offices"] = [
             o.strip() for o in (c.get("offices") or []) if isinstance(o, str) and o.strip()
         ]
@@ -244,6 +256,12 @@ class LLMClient:
         429 (quota exhausted) is handled here, by rotating to the next model.
         """
         record_pentru = {str(m["id"]): m.get("record", {}) for m in membri}
+        # tot ce a primit modelul despre fiecare membru (vezi _valideaza: oficialul)
+        sursa_pentru = {
+            str(m["id"]): " ".join((json.dumps(m.get("record", {}), ensure_ascii=False),
+                                    m.get("text") or "", m.get("cv") or ""))
+            for m in membri
+        }
         continut = _prompt_batch(membri)
         while True:
             i = self._i
@@ -265,7 +283,8 @@ class LLMClient:
                 continue
             brut = json.loads(data["choices"][0]["message"]["content"])
             return {
-                str(idm): _valideaza(camp, record_pentru.get(str(idm)), uid=str(idm))
+                str(idm): _valideaza(camp, record_pentru.get(str(idm)), uid=str(idm),
+                                     sursa=sursa_pentru.get(str(idm), ""))
                 for idm, camp in brut.items()
                 if isinstance(camp, dict)
             }

@@ -111,10 +111,31 @@ def test_emailurile_propuse_de_model_sunt_validate_pe_camera_membrului():
         "official_email": "psdsenat2016@gmail.com",
         "other_emails": ["ion.pop@senat.ro", "ion.pop@cdep.ro",
                          "https://www.tiktok.com/@ionpop"]}}})
-    r = c.rafineaza_batch([{"id": "1:5", "text": "t"}])["1:5"]["contacts"]
+    r = c.rafineaza_batch([{"id": "1:5", "text": "E-mail: Ion.Pop@senat.ro"}])["1:5"]["contacts"]
     assert r["official_email"] == "ion.pop@senat.ro"
     # gmail-ul nu e oficial; @cdep.ro la senator si URL-ul nu sunt admise deloc
     assert r["other_emails"] == ["psdsenat2016@gmail.com"]
+
+
+def test_oficial_construit_de_model_din_nume_nu_e_admis():
+    # cazul real (CI, 21.09): 65 de adrese prenume.nume@senat.ro / @cdep.ro care nu
+    # apareau nicaieri in datele membrului
+    c = _client_cu_raspuns({
+        "1:13": {"contacts": {"official_email": "ilie-gavril.bolojan@senat.ro"}},
+        "2:86": {"contacts": {"official_email": None,
+                              "other_emails": ["andrei.csillag@cdep.ro", "csillag@yahoo.com"]}},
+        "2:10": {"contacts": {"official_email": "lucian.andrusca@cdep.ro"}},
+    })
+    r = c.rafineaza_batch([
+        {"id": "1:13", "text": "BOLOJAN Ilie-Gavril, senator", "record": {"nume": "BOLOJAN"}},
+        {"id": "2:86", "text": "CSILLAG Andrei", "cv": "ANTET: E-mail csillag@yahoo.com"},
+        # scrisa in datele CV-ului (alta capitalizare) -> admisa
+        {"id": "2:10", "text": "ANDRUŞCĂ", "cv": "CONTACT [email: Lucian.andrusca@cdep.ro] CONTEXT: …"},
+    ])
+    assert r["1:13"]["contacts"]["official_email"] is None
+    assert r["2:86"]["contacts"]["official_email"] is None  # nici strecurata prin other_emails
+    assert r["2:86"]["contacts"]["other_emails"] == ["csillag@yahoo.com"]
+    assert r["2:10"]["contacts"]["official_email"] == "lucian.andrusca@cdep.ro"
 
 
 def test_eroare_tranzitorie_se_propaga_dintr_o_singura_incercare():
