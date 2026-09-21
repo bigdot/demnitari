@@ -3,8 +3,7 @@ import json
 import pytest
 
 from scrapers.circumscriptii import CIRCUMSCRIPTII, cod_pentru_nr
-from scrapers.build import (CV_CAP, _cap_cv, asambleaza_parlamentar,
-                            scrie_sigle, valideaza)
+from scrapers.build import asambleaza_parlamentar, scrie_sigle, valideaza
 
 
 class _FetcherSigle:
@@ -36,19 +35,6 @@ def test_scrie_sigle_face_merge_nu_clobber(tmp_path):
     assert m["Indep."] == "sigle/indep.svg"  # manualul mereu prezent
 
 
-def test_cv_sub_cap_ramane_neatins():
-    scurt = "x" * 20
-    assert _cap_cv(scurt) == scurt
-
-
-def test_cv_peste_cap_e_taiat_si_marcat():
-    lung = "y" * (CV_CAP + 500)
-    out = _cap_cv(lung)
-    assert out.startswith("y" * CV_CAP)
-    assert "trunchiat" in out          # LLM-ul stie ca fragmentul e taiat
-    assert len(out) < len(lung)
-
-
 def test_tabelul_circumscriptiilor():
     assert len(CIRCUMSCRIPTII) == 43
     assert cod_pentru_nr(1) == "AB"
@@ -59,10 +45,14 @@ def test_tabelul_circumscriptiilor():
     assert len(set(coduri)) == 43
 
 
+_PROFIL_SENATOR = "https://www.cdep.ro/pls/parlam/structura2015.mp?idm=106&cam=1&leg=2024"
+
+
 def _lista_entry(**kw):
     return {
         "idm": 106, "nume_complet": "Fifor Mihai-Viorel", "grup": "PSD",
-        "email": None, "linkuri": [], "profil_url": "https://www.cdep.ro/...idm=106",
+        "email": None, "linkuri": [],
+        "profil_url": "https://www.cdep.ro/pls/parlam/structura2015.mp?idm=106&cam=2&leg=2024",
         **kw,
     }
 
@@ -96,6 +86,26 @@ def test_asamblare_deputat_complet():
     assert c["other_emails"] == ["mfifor@yahoo.com"]
     assert {"facebook": "https://www.facebook.com/fifor"} in c["socials"]
     assert c["numbers"] == []
+
+
+def test_emailul_de_contact_care_nu_e_de_parlament_nu_e_oficial():
+    # cazul real: senat.ro listeaza gmail-ul grupului ca email de contact
+    p = asambleaza_parlamentar(
+        _lista_entry(email=None), _profil(), cv=None,
+        bio={"email": "psdsenat2016@gmail.com", "telefon": None, "birouri": []},
+    )
+    assert p["contacts"]["official_email"] is None
+    assert p["contacts"]["other_emails"] == ["psdsenat2016@gmail.com"]
+
+
+def test_senator_nu_primeste_adresa_de_cdep():
+    # senator: singurul email oficial admis e @senat.ro
+    p = asambleaza_parlamentar(
+        _lista_entry(profil_url=_PROFIL_SENATOR, email="ion.pop@cdep.ro"), _profil(), cv=None,
+        bio={"email": "ion.pop@senat.ro", "telefon": None, "birouri": []},
+    )
+    assert p["contacts"]["official_email"] == "ion.pop@senat.ro"
+    assert p["contacts"]["other_emails"] == []
 
 
 def test_partid_mandat_din_primul_partid_precedent():
@@ -171,7 +181,7 @@ def test_hash_include_textul_cv():
 
 def test_asamblare_senator_cu_biografie():
     p = asambleaza_parlamentar(
-        _lista_entry(),
+        _lista_entry(profil_url=_PROFIL_SENATOR),
         _profil(birouri=[]),
         cv=None,
         bio={"email": "a@senat.ro", "telefon": "0791650126",

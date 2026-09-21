@@ -17,6 +17,8 @@ import logging
 import re
 import time
 
+from scrapers import emailuri, linkuri
+
 log = logging.getLogger("demnitari.build")
 
 # thresholds: legislature 2024-2028 has 331 deputies / 134 senators;
@@ -83,15 +85,6 @@ def _partid_mandat(partide_precedente: dict, partid_curent):
     return partid_curent
 
 
-def _clasifica_link(url: str) -> str:
-    for retea in ("facebook", "instagram", "linkedin", "youtube", "tiktok"):
-        if retea in url:
-            return retea
-    if re.search(r"(x|twitter)\.com/", url):
-        return "x"
-    return "site"
-
-
 def asambleaza_parlamentar(
     lista_entry: dict, profil: dict, cv: dict | None, bio: dict | None,
     cv_text: str = "",
@@ -110,7 +103,7 @@ def asambleaza_parlamentar(
             socials.append({tip: url})
 
     for url in lista_entry.get("linkuri", []):
-        _adauga_link(_clasifica_link(url), url)
+        _adauga_link(linkuri.clasifica(url), url)
     for cheie, valoare in (cv or {}).items():
         if cheie == "email":
             other_emails.append(valoare)
@@ -119,23 +112,32 @@ def asambleaza_parlamentar(
     if bio and bio.get("telefon"):
         numbers.append(bio["telefon"])
 
+    # idm is per-chamber (deputy idm=1 != senator idm=1), so the global cache
+    # key is chamber + idm. cam=2 deputies, cam=1 senators (from the profil URL).
+    cam_m = re.search(r"cam=(\d+)", lista_entry["profil_url"])
+    uid = f"{cam_m.group(1) if cam_m else '?'}:{lista_entry['idm']}"
+
+    # emailul de contact listat de sursa, apoi cel din CV — fiecare validat inainte
+    # sa intre intr-un camp: oficial e doar domeniul camerei lui (deputat @cdep.ro,
+    # senator @senat.ro), restul sunt emailuri simple, cealalta camera nu se admite
+    official_email, other_emails = emailuri.admite(
+        [lista_entry.get("email"), (bio or {}).get("email"), *other_emails],
+        uid, cine=lista_entry.get("nume", ""))
+
     contacts = {
-        "official_email": lista_entry.get("email") or (bio or {}).get("email"),
+        "official_email": official_email,
         "other_emails": other_emails,
         "offices": profil.get("birouri") or (bio or {}).get("birouri") or [],
         "numbers": numbers,
         "socials": socials,
         "website": website,
     }
+    # linkurile parsate: URL invalid scos, fiecare retea dupa host, fara dubluri
+    linkuri.normalizeaza(contacts, cine=lista_entry.get("nume", ""))
 
     import json as _json
 
     from scrapers.llm import hash_text
-
-    # idm is per-chamber (deputy idm=1 != senator idm=1), so the global cache
-    # key is chamber + idm. cam=2 deputies, cam=1 senators (from the profil URL).
-    cam_m = re.search(r"cam=(\d+)", lista_entry["profil_url"])
-    uid = f"{cam_m.group(1) if cam_m else '?'}:{lista_entry['idm']}"
 
     # party the seat was won with = earliest entry in the party history (period
     # keys are "YYYY-MM_YYYY-MM"); if they never switched, it's the current one.
@@ -256,23 +258,19 @@ def _aplica_rafinare(entity: dict, rafinare: dict) -> None:
                 c[cheie] = r[cheie]
 
 
-BATCH_LLM = 50
-# cap on the CV free text sent to the LLM — academic CVs can be huge, and the
-# member's own contacts sit in the header/contact block near the top
-CV_CAP = 5000
-_CV_TRUNCHIAT = " […text CV trunchiat…]"
+# pauzele (secunde) dintre reincercarile unui batch LLM picat; ruleaza in
+# workerul de retry, deci nu tin pe loc batch-urile urmatoare
+_PAUZE_RETRY_LLM = (5, 15, 45)
 
-
-def _cap_cv(text: str) -> str:
-    """Cap the CV text sent to the LLM, appending a marker when it was cut so
-    the model knows it's a partial excerpt (not the whole CV)."""
-    if len(text) > CV_CAP:
-        return text[:CV_CAP] + _CV_TRUNCHIAT
-    return text
+# membri per prompt. Ce strica atentia modelului e volumul de text: la 50 sarea
+# peste membri, la 10 inca rata completari din CV in batch-urile de ~35k
+# caractere (singuri ii nimerea de fiecare data). Masurat cu CV-uri trimise
+# intregi (taiate la 5000); acum din CV pleaca doar cdep.cv_contacte.
+BATCH_LLM = 5
 
 
 def rafineaza_stage2(circumscriptii: list[dict], texte_dir, client,
-                     precedent: dict | None, batch: int = BATCH_LLM) -> int:
+                     precedent: dict | None, batch: int | None = None) -> tuple[int, set]:
     """Stage 2: LLM record correction, run after the mechanical scrape.
 
     Cache: a member whose profile_text_hash matches the previous publish
@@ -316,46 +314,90 @@ def rafineaza_stage2(circumscriptii: list[dict], texte_dir, client,
     CAMPURI_RECORD = ("nume", "prenume", "grup", "grup_long", "afiliere",
                       "partid", "partid_long", "partid_mandat", "contacts")
 
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    batch = batch or BATCH_LLM
     per_uid = {e["uid"]: e for e in de_rafinat}
     esuati: set[str] = set()  # uids whose batch failed (stage2 not done -> retry)
-    cereri = 0
-    for i in range(0, len(de_rafinat), batch):
-        felie = de_rafinat[i:i + batch]
-        payload = []
+    total = (len(de_rafinat) + batch - 1) // batch
+
+    def aplica(felie, rezultat):
+        # entitatile se modifica DOAR din thread-ul principal
         for e in felie:
-            slug = e["uid"].replace(":", "_")
-            cale = Path(texte_dir) / f"{slug}.txt"
-            text = cale.read_text(encoding="utf-8") if cale.exists() else ""
-            cale_cv = Path(texte_dir) / f"{slug}.cv.txt"
-            cv = cale_cv.read_text(encoding="utf-8") if cale_cv.exists() else ""
-            record = {k: e[k] for k in CAMPURI_RECORD if k in e}
-            payload.append({"id": e["uid"], "text": text, "cv": cv, "record": record})
-        cereri += 1
-        try:
-            rezultat = client.rafineaza_batch(payload)
-        except Exception as ex:
-            log.warning("batch LLM %d-%d esuat (%s) — raman mecanici",
-                        i, i + len(felie), ex)
-            esuati.update(e["uid"] for e in felie)
-            continue
-        for uid, camp in rezultat.items():
-            e = per_uid.get(uid)
-            if e is not None and camp:
-                e["_rafinare"] = camp
+            if e["uid"] not in rezultat:
+                # promptul cere TOATE id-urile; unul lipsa = modelul l-a sarit, nu
+                # "e curat" -> ramane None (necache-uit) si se reia
+                esuati.add(e["uid"])
+                continue
+            camp = rezultat[e["uid"]]
+            # {} explicit = verificat, nimic de schimbat -> cache HIT data viitoare
+            e["_rafinare"] = camp or {}
+            if camp:
                 _aplica_rafinare(e, camp)
-        # members the LLM returned nothing for are clean — cache them as {} (not
-        # None) so they're a cache HIT next run instead of churning every build
-        for e in felie:
-            if e["_rafinare"] is None:
-                e["_rafinare"] = {}
-        log.info("stage 2: batch %d/%d trimis", cereri,
-                 (len(de_rafinat) + batch - 1) // batch)
+        sariti = [e["uid"] for e in felie if e["uid"] not in rezultat]
+        if sariti:
+            log.warning("stage 2: modelul a sarit %d id-uri din batch: %s", len(sariti), sariti)
+
+    stop = threading.Event()
+
+    def reincearca(payload, nr):
+        """Ruleaza in worker: backoff + retry, fara sa tina pe loc bucla principala."""
+        ultima: Exception | None = None
+        for k, pauza in enumerate(_PAUZE_RETRY_LLM, 1):
+            if stop.wait(pauza):
+                raise RuntimeError("oprit")
+            try:
+                rezultat = client.rafineaza_batch(payload)
+                log.info("stage 2: batch %d/%d reusit la retry %d", nr, total, k)
+                return rezultat
+            except Exception as ex:
+                ultima = ex
+                log.warning("stage 2: batch %d/%d retry %d/%d esuat (%s)",
+                            nr, total, k, len(_PAUZE_RETRY_LLM), ex)
+        raise ultima
+
+    cereri = 0
+    in_retry = []  # (nr, felie, future)
+    worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-retry")
+    try:
+        for i in range(0, len(de_rafinat), batch):
+            felie = de_rafinat[i:i + batch]
+            payload = []
+            for e in felie:
+                slug = e["uid"].replace(":", "_")
+                cale = Path(texte_dir) / f"{slug}.txt"
+                text = cale.read_text(encoding="utf-8") if cale.exists() else ""
+                cale_cv = Path(texte_dir) / f"{slug}.cv.txt"
+                cv = cale_cv.read_text(encoding="utf-8") if cale_cv.exists() else ""
+                record = {k: e[k] for k in CAMPURI_RECORD if k in e}
+                payload.append({"id": e["uid"], "text": text, "cv": cv, "record": record})
+            cereri += 1
+            try:
+                rezultat = client.rafineaza_batch(payload)
+            except Exception as ex:
+                log.warning("stage 2: batch %d/%d esuat (%s) — il reincearca workerul, "
+                            "merg mai departe", cereri, total, ex)
+                in_retry.append((cereri, felie, worker.submit(reincearca, payload, cereri)))
+                continue
+            aplica(felie, rezultat)
+            log.info("stage 2: batch %d/%d trimis", cereri, total)
+
+        for nr, felie, viitor in in_retry:  # asteapta workerul
+            try:
+                aplica(felie, viitor.result())
+            except Exception as ex:
+                log.warning("stage 2: batch %d/%d abandonat (%s) — raman mecanici", nr, total, ex)
+                esuati.update(e["uid"] for e in felie)
+    finally:
+        stop.set()  # la interrupt, workerul nu mai doarme/reincearca
+        worker.shutdown(wait=True)
     return cereri, esuati
 
 
 def _membru_complet(fetcher, entry: dict, bio: dict | None, texte_dir=None,
                     logo_urls: dict | None = None) -> dict:
-    from scrapers.cdep import cv_text, parse_cv, parse_profil
+    from scrapers.cdep import cv_contacte, cv_text, parse_cv, parse_profil
 
     profil = None
     ultima: Exception | None = None
@@ -386,7 +428,8 @@ def _membru_complet(fetcher, entry: dict, bio: dict | None, texte_dir=None,
         try:
             html_cv = fetcher.get(profil["cv_url"]).text
             cv = parse_cv(html_cv)
-            cvt = _cap_cv(cv_text(html_cv))  # raw text for the LLM stage (capped)
+            # for the LLM stage: CV header + the contacts found in it, in context
+            cvt = cv_contacte(cv_text(html_cv))
         except Exception as e:
             log.warning("CV inaccesibil pentru %s (%s) — public fara CV",
                         entry["nume_complet"], e)
@@ -674,6 +717,22 @@ def ruleaza(fetcher, out_dir, leg: int = 2024, client="auto",
     if rec is not None:
         for m in (x for c in circumscriptii for x in c["deputati"] + c["senatori"]):
             R.marcheaza(rec, m["uid"], s2=(m["uid"] not in esuati))
+
+    # telefoane: un singur loc, la final — orice sursa (mecanic, LLM, cache) ->
+    # E.164 valid, deduplicat; ce nu e numar valid se scoate
+    from scrapers import telefoane
+
+    for m in (x for c in circumscriptii for x in c["deputati"] + c["senatori"]):
+        m["contacts"]["numbers"] = telefoane.normalizeaza(
+            m["contacts"]["numbers"], cine=f"{m['prenume']} {m['nume']}")
+
+    # website-uri: reachability check la fiecare build; un site care nu raspunde
+    # nu se publica (in cache ramane — daca revine, reapare la urmatorul build)
+    for m in (x for c in circumscriptii for x in c["deputati"] + c["senatori"]):
+        site = m["contacts"]["website"]
+        if site and not linkuri.is_reachable(site):
+            log.warning("website unreachable, scos: %s (%s %s)", site, m["prenume"], m["nume"])
+            m["contacts"]["website"] = None
 
     # validarea (valideaza) e un pas SEPARAT, in seama apelantului (__main__) —
     # ruleaza doar buildeaza + scrie. Deploy-ul e gatuit de validare oricum.

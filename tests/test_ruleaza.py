@@ -15,6 +15,8 @@ _fetch_lista_reala = build._fetch_lista_cdep
 def _run_in_tmp(tmp_path, monkeypatch):
     # ruleaza scrie in run/ (relativ) — muta cwd in tmp ca sa nu atinga ./run din repo
     monkeypatch.chdir(tmp_path)
+    # fara retea in teste: reachability check-ul de website-uri raspunde "da"
+    monkeypatch.setattr(build.linkuri, "is_reachable", lambda url: True)
 
 
 class _Resp:
@@ -64,6 +66,11 @@ def patch_pick_5_members(monkeypatch):
                         lambda f, u, r: pick_5_members(_fetch_lista_reala(f, u, r)))
 
 
+def nr_batchuri(membri=10):
+    """Cate cereri LLM fac `membri` membri la marimea curenta de batch."""
+    return -(-membri // build.BATCH_LLM)
+
+
 def primul_deputat(out_dir):
     for f in sorted((out_dir / "parlamentari").glob("*.json")):
         d = json.loads(f.read_text())
@@ -88,8 +95,8 @@ def test_ruleaza_cap_coada(tmp_path):
     # merge listă + profil: grupul scurt din listă, istoricul din profil
     d = cj["deputati"][0]
     assert "grup" in d and "grup_long" in d and "partide_precedente" in d
-    # merge bio senat.ro: telefonul din biografie
-    assert "0791650126" in cj["senatori"][0]["contacts"]["numbers"]
+    # merge bio senat.ro: telefonul din biografie, normalizat E.164 la final
+    assert cj["senatori"][0]["contacts"]["numbers"] == ["+40791650126"]
 
     meta = json.loads((tmp_path / "meta.json").read_text())
     assert meta["deputati"] == 330
@@ -111,21 +118,62 @@ class _ClientNumara:
 
 
 class _ClientCaptura:
-    """Client LLM fals: retine ce i s-a trimis, nu corecteaza nimic."""
+    """Client LLM fals: retine ce i s-a trimis; raspunde {} (verificat, curat)
+    pentru fiecare id, cum cere promptul."""
 
     def __init__(self):
         self.payloads = []
 
     def rafineaza_batch(self, membri):
         self.payloads.extend(membri)
-        return {}
+        return {str(m["id"]): {} for m in membri}
+
+
+class _ClientSareUnId:
+    """Modelul 'uita' primul id din batch (nu-l intoarce deloc)."""
+
+    def rafineaza_batch(self, membri):
+        return {str(m["id"]): {} for m in membri[1:]}
+
+
+class _ClientDaWebsite:
+    """Client LLM fals: gaseste cate un website pentru fiecare membru."""
+
+    def rafineaza_batch(self, membri):
+        return {str(m["id"]): {"contacts": {"website": f"https://site-{i}.ro"}}
+                for i, m in enumerate(membri)}
+
+
+def test_website_unreachable_nu_se_publica(tmp_path, monkeypatch):
+    patch_pick_5_members(monkeypatch)
+    monkeypatch.setattr(build.linkuri, "is_reachable", lambda url: url != "https://site-0.ro")
+    rez = ruleaza(_FetcherFixture(), tmp_path, leg=2024, client=_ClientDaWebsite())
+    site_uri = [m["contacts"]["website"]
+                for c in rez["circumscriptii"] for m in c["deputati"] + c["senatori"]]
+    assert "https://site-0.ro" not in site_uri
+    assert "https://site-1.ro" in site_uri
+    # in cache ramane ce a zis modelul: la urmatorul build se reverifica
+    rafinari = [m["_rafinare"]["contacts"]["website"]
+                for c in rez["circumscriptii"] for m in c["deputati"] + c["senatori"]]
+    assert "https://site-0.ro" in rafinari
+
+
+def test_id_sarit_de_model_nu_e_curat_ci_de_reluat(tmp_path, monkeypatch):
+    patch_pick_5_members(monkeypatch)
+    rez = ruleaza(_FetcherFixture(), tmp_path, leg=2024, client=_ClientSareUnId())
+    sariti = nr_batchuri()  # cate unul din fiecare batch; restul sunt {} = curati
+    assert len(rez["incomplet"]) == sariti
+    toti = {m["uid"]: m for c in rez["circumscriptii"] for m in c["deputati"] + c["senatori"]}
+    for uid in rez["incomplet"]:
+        assert toti[uid]["_rafinare"] is None  # necache-uit -> se reia data viitoare
+    assert sum(1 for m in toti.values() if m["_rafinare"] == {}) == 10 - sariti
 
 
 def test_llm_un_batch_prima_data_si_cache_a_doua(tmp_path, monkeypatch):
     patch_pick_5_members(monkeypatch)
     c1 = _ClientNumara()
     ruleaza(_FetcherFixture(), tmp_path, leg=2024, client=c1)
-    assert c1.cereri == 1  # 10 membri intr-un singur batch, nu 10 cereri
+    assert c1.cereri == nr_batchuri()  # pe batch-uri, nu o cerere per membru
     d = primul_deputat(tmp_path)
     assert d["contacts"]["offices"] == ["Birou rafinat LLM"]
     assert d["profile_text_hash"]
@@ -167,7 +215,7 @@ def test_json_sters_reface_totul(tmp_path, monkeypatch):
     shutil.rmtree(tmp_path / "parlamentari")
     c2 = _ClientNumara()
     ruleaza(_FetcherFixture(), tmp_path, leg=2024, client=c2)
-    assert c2.cereri == 1
+    assert c2.cereri == nr_batchuri()
 
 
 def test_fara_client_build_ul_merge_fara_rafinare(tmp_path, monkeypatch):
@@ -277,20 +325,60 @@ def test_all_forteaza_llm_si_nu_scrie_receipt(tmp_path, monkeypatch):
     ruleaza(_FetcherFixture(), tmp_path, leg=2024, client=_ClientNumara())
     c = _ClientNumara()
     ruleaza(_FetcherFixture(), tmp_path, leg=2024, client=c, mod="all", run_dir="run_all")
-    assert c.cereri == 1  # ignora cache-ul: toti din nou la LLM
+    assert c.cereri == nr_batchuri()  # ignora cache-ul: toti din nou la LLM
     assert not Path("run_all/receipt.json").exists()
 
 
 class _ClientPica:
+    def __init__(self):
+        self.apeluri = 0
+
     def rafineaza_batch(self, membri):
+        self.apeluri += 1
         raise RuntimeError("503 Service Unavailable")
 
 
-def test_batch_esuat_iese_incomplet(tmp_path, monkeypatch):
+def test_batch_esuat_definitiv_iese_incomplet(tmp_path, monkeypatch):
     patch_pick_5_members(monkeypatch)
-    rez = ruleaza(_FetcherFixture(), tmp_path, leg=2024, client=_ClientPica())
+    monkeypatch.setattr(build, "_PAUZE_RETRY_LLM", (0, 0, 0))
+    c = _ClientPica()
+    rez = ruleaza(_FetcherFixture(), tmp_path, leg=2024, client=c)
+    assert c.apeluri == nr_batchuri() * 4  # per batch: 1 in bucla principala + 3 in worker
     assert len(rez["incomplet"]) == 10  # publicat mecanic, dar de reluat
     assert primul_deputat(tmp_path)["_rafinare"] is None
+
+
+class _ClientPicaPrimulBatch:
+    """Primul batch da 503 la prima incercare; tine minte ordinea apelurilor."""
+
+    def __init__(self):
+        self.apeluri = []  # (thread, primul uid din batch)
+        self.picat = False
+
+    def rafineaza_batch(self, membri):
+        import threading
+
+        self.apeluri.append((threading.current_thread().name, membri[0]["id"]))
+        if not self.picat:
+            self.picat = True
+            raise RuntimeError("503 Service Unavailable")
+        return {str(m["id"]): {"contacts": {"offices": ["Birou rafinat LLM"]}} for m in membri}
+
+
+def test_batch_picat_e_reincercat_de_worker_fara_sa_blocheze(tmp_path, monkeypatch):
+    patch_pick_5_members(monkeypatch)
+    monkeypatch.setattr(build, "BATCH_LLM", 5)  # 10 membri -> 2 batch-uri
+    monkeypatch.setattr(build, "_PAUZE_RETRY_LLM", (0.2,))
+    c = _ClientPicaPrimulBatch()
+    rez = ruleaza(_FetcherFixture(), tmp_path, leg=2024, client=c)
+
+    assert rez["incomplet"] == []  # batch-ul picat a fost recuperat
+    fire = [t for t, _ in c.apeluri]
+    # batch 1 (pica) si batch 2 din thread-ul principal, retry-ul din worker...
+    assert fire[0] == fire[1] == "MainThread" and fire[2].startswith("llm-retry")
+    # ...iar batch 2 a plecat INAINTE de retry (bucla principala n-a asteptat)
+    assert c.apeluri[0][1] == c.apeluri[2][1] != c.apeluri[1][1]
+    assert primul_deputat(tmp_path)["contacts"]["offices"] == ["Birou rafinat LLM"]
 
 
 def test_fetch_lista_cdep_reincearca_pe_gol(monkeypatch):

@@ -22,11 +22,11 @@ import re
 
 from bs4 import BeautifulSoup
 
+from scrapers import emailuri, telefoane
+
 BIOGRAFIE_EVENTTARGET = "ctl00$B_Center$Repeater14$ctl00$lnkBiog"
 
 _HIDDEN = ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION")
-_TELEFON_RE = re.compile(r"(\+?40?\s?7\d{8}|0\d{9})")
-_EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.\w+")
 
 
 def extract_postback_fields(html: str) -> dict[str, str]:
@@ -70,13 +70,13 @@ def parse_biografie(html: str) -> dict:
 
     for linie in _linii_dupa_eticheta(soup, "Coordonate de contact"):
         if bio["email"] is None:
-            m = _EMAIL_RE.search(linie)
-            if m:
-                bio["email"] = m.group(0)
+            gasite = emailuri.gaseste(linie)
+            if gasite:
+                bio["email"] = gasite[0]
         if bio["telefon"] is None:
-            m = _TELEFON_RE.search(linie)
-            if m:
-                bio["telefon"] = m.group(1)
+            gasite = telefoane.gaseste(linie)
+            if gasite:
+                bio["telefon"] = gasite[0]
         if bio["email"] and bio["telefon"]:
             break
 

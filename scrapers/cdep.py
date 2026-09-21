@@ -26,7 +26,9 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
-BASE = "https://www.cdep.ro"
+from scrapers import emailuri, linkuri, telefoane
+
+BASE ="https://www.cdep.ro"
 
 # Parliament of the 2024-2028 legislature was validated in December 2024.
 # History entries without an explicit "din <luna> <an>" started with the mandate.
@@ -94,7 +96,10 @@ def parse_lista(html: str) -> list[dict]:
         for a in tr.find_all("a", href=True):
             h = a["href"]
             if h.startswith("mailto:") and "webmaster" not in h:
-                email = h.removeprefix("mailto:").strip()
+                # cdep mai pune si URL-uri sub mailto: (ex: un link de tiktok)
+                adresa = h.removeprefix("mailto:").strip()
+                if emailuri.e_valid(adresa):
+                    email = adresa
             elif h.startswith("http") and "cdep.ro" not in h:
                 linkuri.append(_clean_external(h))
 
@@ -291,7 +296,6 @@ def parse_profil(html: str) -> dict:
     }
 
 
-_EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.\w+")
 _SOCIAL = {
     "facebook": re.compile(r"https?://(?:www\.)?facebook\.com/"),
     "instagram": re.compile(r"https?://(?:www\.)?instagram\.com/"),
@@ -307,6 +311,10 @@ def _cv_soup(html: str) -> BeautifulSoup:
         el.decompose()
     for el in soup.find_all(class_=re.compile(r"footer|header2025|social")):
         el.decompose()
+    # left columns (content-left, content-left2025) = the site's navigation
+    # (legislatures, A-Z index, activity links); the CV lives in the right column
+    for el in soup.find_all("div", class_=re.compile(r"^content-left")):
+        el.decompose()
     return soup
 
 
@@ -314,6 +322,52 @@ def cv_text(html: str) -> str:
     """Cleaned free text of a CV page, handed to the LLM in stage 2 so it can
     pull phones / extra emails our mechanical parse_cv doesn't extract."""
     return _cv_soup(html).get_text(" ", strip=True)
+
+
+CV_ANTET = 600      # the top of the CV (name, address, own contacts), sent as is
+CV_CONTEXT = (200, 80)  # characters kept before / after a contact found below it
+
+
+def cv_contacte(text: str) -> str:
+    """What stage 2 gets from a CV: the header + every contact found in the rest
+    of it, each with the text around it.
+
+    The LLM only takes contacts out of a CV, and academic CVs run to 37k
+    characters — so instead of the whole text (or a blind cut that loses what
+    sits past it) the emails / phones / URLs are located mechanically over the
+    WHOLE CV and handed over with enough context to tell whose they are
+    ("Editor al blogului www.x.ro" vs "Universitatea Y, site de internet www.y.ro").
+    """
+    text = " ".join((text or "").split())
+    if not text:
+        return ""
+    gasite = sorted(
+        [(s, e, "email", v) for s, e, v in emailuri.pozitii(text)]
+        + [(s, e, "telefon", v) for s, e, v in telefoane.pozitii(text)]
+        + [(s, e, "url", v) for s, e, v in linkuri.pozitii(text)])
+    emailuri_span = [(s, e) for s, e, tip, _ in gasite if tip == "email"]
+    fragmente: list[dict] = []
+    vazute: set[str] = set()
+    for s, e, tip, v in gasite:
+        if tip == "url" and any(a <= s and e <= b for a, b in emailuri_span):
+            continue  # domeniul unui email, nu un link
+        cheie = v.lower().rstrip("/")
+        if cheie in vazute:
+            continue  # aceeasi valoare, mai jos in CV — prima aparitie ajunge
+        vazute.add(cheie)
+        if s < CV_ANTET:
+            continue  # modelul il vede deja in antet
+        if fragmente and s - fragmente[-1]["e"] < CV_CONTEXT[1]:
+            fragmente[-1]["valori"].append(f"{tip}: {v}")  # acelasi loc din CV
+            fragmente[-1]["e"] = e
+        else:
+            fragmente.append({"s": s, "e": e, "valori": [f"{tip}: {v}"]})
+
+    linii = [f"ANTET: {text[:CV_ANTET]}"]
+    for f in fragmente:
+        context = text[max(CV_ANTET, f["s"] - CV_CONTEXT[0]):f["e"] + CV_CONTEXT[1]]
+        linii.append(f"CONTACT [{'; '.join(f['valori'])}] CONTEXT: …{context}…")
+    return "\n".join(linii)
 
 
 def parse_cv(html: str) -> dict:
@@ -332,7 +386,7 @@ def parse_cv(html: str) -> dict:
     contacte: dict[str, str] = {}
 
     text = soup.get_text(" ", strip=True)
-    for email in _EMAIL_RE.findall(text):
+    for email in emailuri.gaseste(text):
         if not email.lower().endswith(("@cdep.ro", "@senat.ro")):
             contacte["email"] = email
             break

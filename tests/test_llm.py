@@ -1,30 +1,9 @@
 import json
 
-import pytest
+from scrapers.llm import LLMClient, hash_text
 
-from scrapers.llm import LLMClient, hash_text, normalize_phone_number
-
-
-@pytest.mark.parametrize("brut,asteptat", [
-    ("0726.200.645", "+40726200645"),      # national cu puncte
-    ("0726200645", "+40726200645"),        # national lipit
-    ("0726 200 645", "+40726200645"),      # national cu spatii
-    ("+40 723 257 640", "+40723257640"),   # international cu spatii
-    ("+40723257640", "+40723257640"),      # deja canonic
-    ("+ 40 723 257 640", "+40723257640"),  # plus rupt de spatiu
-    ("(+40) 234588884", "+40234588884"),   # prefix in paranteze
-    ("0040726200645", "+40726200645"),     # 00 in loc de +
-    ("40723257640", "+40723257640"),       # fara + si fara 0
-    ("0364 808 736", "+40364808736"),      # fix Cluj
-])
-def test_normalize_phone_number_la_international(brut, asteptat):
-    assert normalize_phone_number(brut) == asteptat
-
-
-def test_normalize_phone_number_lasa_neschimbat_ce_nu_recunoaste():
-    # 9 cifre, nu e numar RO valid — nu fabricam un prefix
-    assert normalize_phone_number("065275904") == "065275904"
-    assert normalize_phone_number("") == ""
+# NB: telefoanele nu se valideaza/normalizeaza aici — LLM-ul doar le propune;
+# E.164 + validarea se fac intr-un singur loc, la final (tests/test_telefoane.py)
 
 
 def test_hash_stabil_si_sensibil():
@@ -57,9 +36,9 @@ def test_batch_curata_si_valideaza_pe_id():
     )
     r = c.rafineaza_batch([{"id": 213, "text": "t", "record": {}}])["213"]["contacts"]
     assert r["offices"] == ["Cluj-Napoca, Str. X nr. 1", "Huedin, Str. Y"]  # gol scos
-    assert r["numbers"] == ["+40364808736"]  # textul invalid respins + normalizat
+    assert r["numbers"] == ["0364 808 736", "text invalid"]  # validarea e la final
     assert r["other_emails"] == ["oana@murariu.legal"]
-    assert r["socials"] == [{"facebook": "fb.com/oana"}]  # {bad:5} respins
+    assert r["socials"] == [{"facebook": "https://fb.com/oana"}]  # {bad:5} respins
     assert r["website"] == "https://oanamurariu.ro"  # protocol adaugat
 
 
@@ -114,18 +93,10 @@ def test_grup_necunoscut_e_respins():
     assert "grup" not in r
 
 
-def test_telefon_invalid_e_respins():
-    c = _client_cu_raspuns({"5": {"contacts": {"numbers": ["sunati la cabinet"]}}})
+def test_numere_non_string_sunt_respinse():
+    c = _client_cu_raspuns({"5": {"contacts": {"numbers": ["0726 200 645", 5, None, "  "]}}})
     r = c.rafineaza_batch([{"id": 5, "text": "t"}])["5"]["contacts"]
-    assert r["numbers"] == []
-
-
-def test_numerele_se_normalizeaza_si_se_deduplica():
-    # acelasi numar in doua formatari -> un singur numar canonic
-    c = _client_cu_raspuns(
-        {"5": {"contacts": {"numbers": ["0726.200.645", "0726 200 645", "+40 723 257 640"]}}})
-    r = c.rafineaza_batch([{"id": 5, "text": "t"}])["5"]["contacts"]
-    assert r["numbers"] == ["+40726200645", "+40723257640"]
+    assert r["numbers"] == ["0726 200 645"]
 
 
 def test_email_fara_arond_respins():
@@ -134,40 +105,50 @@ def test_email_fara_arond_respins():
     assert r["other_emails"] == []
 
 
-def test_reincearca_la_eroare_tranzitorie(monkeypatch):
-    monkeypatch.setattr("time.sleep", lambda s: None)
-    c = LLMClient(api_key="test")
-    ok = '{"5": {"contacts": {"numbers": ["0364 808 736"]}}}'
-    raspunsuri = [RuntimeError("503"), RuntimeError("503"),
-                  {"choices": [{"message": {"content": ok}}]}]
-
-    def fake_post(payload):
-        r = raspunsuri.pop(0)
-        if isinstance(r, Exception):
-            raise r
-        return r
-
-    c._post = fake_post
-    r = c.rafineaza_batch([{"id": 5, "text": "t"}])["5"]["contacts"]
-    assert r["numbers"] == ["+40364808736"]
+def test_emailurile_propuse_de_model_sunt_validate_pe_camera_membrului():
+    # id-ul e uid-ul: "1:…" = senator -> singurul oficial admis e @senat.ro
+    c = _client_cu_raspuns({"1:5": {"contacts": {
+        "official_email": "psdsenat2016@gmail.com",
+        "other_emails": ["ion.pop@senat.ro", "ion.pop@cdep.ro",
+                         "https://www.tiktok.com/@ionpop"]}}})
+    r = c.rafineaza_batch([{"id": "1:5", "text": "t"}])["1:5"]["contacts"]
+    assert r["official_email"] == "ion.pop@senat.ro"
+    # gmail-ul nu e oficial; @cdep.ro la senator si URL-ul nu sunt admise deloc
+    assert r["other_emails"] == ["psdsenat2016@gmail.com"]
 
 
-def test_renunta_dupa_toate_incercarile(monkeypatch):
+def test_eroare_tranzitorie_se_propaga_dintr_o_singura_incercare():
+    # clientul nu doarme si nu reincearca: un 503 iese imediat, iar retry-ul cu
+    # backoff il face workerul din build (nu tine pe loc celelalte batch-uri)
     import pytest
 
-    monkeypatch.setattr("time.sleep", lambda s: None)
     c = LLMClient(api_key="test")
+    apeluri = []
 
-    def mereu_pica(payload):
-        raise RuntimeError("503")
+    def pica(payload):
+        apeluri.append(1)
+        raise RuntimeError("503 Service Unavailable")
 
-    c._post = mereu_pica
-    with pytest.raises(RuntimeError):
+    c._post = pica
+    with pytest.raises(RuntimeError, match="503"):
+        c.rafineaza_batch([{"id": 5, "text": "t"}])
+    assert len(apeluri) == 1
+
+
+def test_toate_modelele_pe_429_da_eroare():
+    import pytest
+
+    c = LLMClient(models=["model-a", "model-b"], api_key="test")
+
+    def quota(payload):
+        raise RuntimeError("429 Too Many Requests")
+
+    c._post = quota
+    with pytest.raises(RuntimeError, match="429"):
         c.rafineaza_batch([{"id": 5, "text": "t"}])
 
 
-def test_roteste_modelul_la_429(monkeypatch):
-    monkeypatch.setattr("time.sleep", lambda s: None)
+def test_roteste_modelul_la_429():
     c = LLMClient(models=["model-a", "model-b"], api_key="test")
     folosite = []
 
@@ -179,7 +160,7 @@ def test_roteste_modelul_la_429(monkeypatch):
 
     c._post = post
     r = c.rafineaza_batch([{"id": 5, "text": "t", "record": {}}])
-    assert r["5"]["contacts"]["numbers"] == ["+40364808736"]
+    assert r["5"]["contacts"]["numbers"] == ["0364 808 736"]
     assert "model-a" in folosite and "model-b" in folosite
     # dupa epuizarea lui a, ramane pe b pentru batch-urile urmatoare
     assert c.model == "model-b"
@@ -210,7 +191,8 @@ def test_promptul_include_cv_ul_si_instructiunea():
         {"id": 213, "text": "PROFIL", "cv": "TEXT_CV_UNIC", "record": {}},
     ])
     trimis = captat["messages"][0]["content"]
-    assert "text CV:" in trimis
+    assert "date CV:" in trimis
     assert "TEXT_CV_UNIC" in trimis
-    # instructiunea: ia doar contactele lui, nu ale altor institutii din CV
-    assert "CV" in trimis and "institut" in trimis.lower()
+    # promptul explica formatul extrasului din CV si ca modelul decide din context
+    assert "ANTET:" in trimis and "CONTACT [" in trimis and "CONTEXT:" in trimis
+    assert "institut" in trimis.lower()

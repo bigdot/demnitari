@@ -7,6 +7,7 @@ dependencies = [
     "requests",
     "lxml",
     "beautifulsoup4",
+    "phonenumbers>=9.0.39",
 ]
 
 [project.optional-dependencies]
