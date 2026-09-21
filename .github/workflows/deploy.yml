@@ -62,18 +62,27 @@ jobs:
           WG_CONF: ${{ secrets.WG_CONF }}
         run: |
           set +e
-          # --- tunel WireGuard (doar pt scrape; build/deploy raman directe) ---
-          # DNS-ul din config: il setam manual (runnerul foloseste un DNS intern
-          # Azure, inaccesibil prin tunel); il scoatem din .conf ca wg-quick sa nu
-          # ceara resolvconf (lipsa pe Ubuntu 24.04)
-          DNS=$(printf '%s' "$WG_CONF" | sed -n 's/^[[:space:]]*DNS[[:space:]]*=[[:space:]]*//p' | cut -d, -f1 | tr -d ' ')
+          # --- tunel WireGuard, SPLIT: prin el merg doar sursele care blocheaza
+          # runnerul. Restul (GitHub — inclusiv streamul de loguri al runnerului,
+          # Gemini, DNS) ramane direct; cu 0.0.0.0/0 runnerul isi pierdea legatura
+          # cu GitHub cat timp tunelul era sus. WG_CONF nu are voie sa aiba DNS:
+          # wg-quick ar cere resolvconf (lipsa pe Ubuntu 24.04), si oricum folosim
+          # DNS-ul runnerului.
+          IPS=$(getent ahostsv4 www.cdep.ro www.senat.ro | awk '{print $1"/32"}' | sort -u | paste -sd,)
+          [ -n "$IPS" ] || { echo "::error::nu pot rezolva cdep/senat"; exit 1; }
+          echo "prin tunel: $IPS"
+          if printf '%s' "$WG_CONF" | grep -q '^[[:space:]]*DNS'; then
+            echo "::error::wg conf must not have DNS"
+            exit 1
+          fi
           sudo mkdir -p /etc/wireguard
-          printf '%s' "$WG_CONF" | grep -v '^[[:space:]]*DNS' | sudo tee /etc/wireguard/wg0.conf >/dev/null
+          printf '%s' "$WG_CONF" | sed "s#^[[:space:]]*AllowedIPs.*#AllowedIPs = $IPS#" \
+            | sudo tee /etc/wireguard/wg0.conf >/dev/null
           sudo chmod 600 /etc/wireguard/wg0.conf
           sudo wg-quick up wg0 || { echo "::error::tunel WireGuard esuat"; exit 1; }
           trap 'sudo wg-quick down wg0 || true' EXIT
-          sudo rm -f /etc/resolv.conf
-          echo "nameserver ${DNS:-1.1.1.1}" | sudo tee /etc/resolv.conf >/dev/null
+          curl -sS --max-time 30 -o /dev/null -w "cdep prin tunel: HTTP %{http_code} in %{time_total}s\n" \
+            "https://www.cdep.ro/" || { echo "::error::cdep inaccesibil prin tunel"; exit 1; }
           # --- scrape (cu retry pe 503) ---
           just scrape; code=$?
           n=0
@@ -83,11 +92,13 @@ jobs:
             sleep 120
             just scrape --continue; code=$?
           done
-          if [ "$code" -eq 1 ]; then
-            echo "::error::scrape esuat definitiv — nu publicam"
-            exit 1
+          # publicam doar la 0 (complet) sau 2 (partial, baseline mecanic valid);
+          # orice altceva (1 = esec, 130 = intrerupt...) opreste job-ul
+          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then
+            echo "::error::scrape esuat (exit $code) — nu publicam"
+            exit "$code"
           fi
-          exit 0  # code 0 (complet) sau 2 (partial, dar baseline mecanic valid)
+          exit 0
 
       - name: Save date
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.date.outputs.cache-matched-key == ''
