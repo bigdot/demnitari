@@ -49,13 +49,29 @@ jobs:
           restore-keys: date-
 
       # scrape doar la cron / manual / prima data (cache gol); push-ul de cod
-      # refoloseste datele restaurate
+      # refoloseste datele restaurate. Sursele (cdep/senat) blocheaza IP-urile
+      # de datacenter ale runnerului -> scrapem printr-un tunel WireGuard (exit RO).
       - name: Scrape
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.date.outputs.cache-matched-key == ''
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          WG_CONF: ${{ secrets.WG_CONF }}
         run: |
           set +e
+          # --- tunel WireGuard (doar pt scrape; build/deploy raman directe) ---
+          sudo apt-get update && sudo apt-get install -y wireguard-tools
+          # DNS-ul din config: il setam manual (runnerul foloseste un DNS intern
+          # Azure, inaccesibil prin tunel); il scoatem din .conf ca wg-quick sa nu
+          # ceara resolvconf (lipsa pe Ubuntu 24.04)
+          DNS=$(printf '%s' "$WG_CONF" | sed -n 's/^[[:space:]]*DNS[[:space:]]*=[[:space:]]*//p' | cut -d, -f1 | tr -d ' ')
+          sudo mkdir -p /etc/wireguard
+          printf '%s' "$WG_CONF" | grep -v '^[[:space:]]*DNS' | sudo tee /etc/wireguard/wg0.conf >/dev/null
+          sudo chmod 600 /etc/wireguard/wg0.conf
+          sudo wg-quick up wg0 || { echo "::error::tunel WireGuard esuat"; exit 1; }
+          trap 'sudo wg-quick down wg0 || true' EXIT
+          sudo rm -f /etc/resolv.conf
+          echo "nameserver ${DNS:-1.1.1.1}" | sudo tee /etc/resolv.conf >/dev/null
+          # --- scrape (cu retry pe 503) ---
           uv run python -m scrapers; code=$?
           n=0
           while [ "$code" -eq 2 ] && [ "$n" -lt 3 ]; do
