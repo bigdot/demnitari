@@ -10,6 +10,7 @@ class _FakeResponse:
     def __init__(self, status_code=200, text="ok"):
         self.status_code = status_code
         self.text = text
+        self.content = text.encode()
 
     def raise_for_status(self):
         if self.status_code >= 400:

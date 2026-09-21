@@ -478,6 +478,28 @@ def _incarca_precedent(out_dir) -> dict:
     return precedent
 
 
+def _cale_membru(run_dir, uid: str):
+    from pathlib import Path
+
+    return Path(run_dir) / "membri" / (uid.replace(":", "_") + ".json")
+
+
+def _persist_membru(run_dir, entity: dict) -> None:
+    """Scrie entitatea (mecanica) pe disc imediat ce e scrapata, ca un interrupt
+    sa nu piarda munca si `--continue` sa reia de la individ (nu de la zero)."""
+    import json
+
+    cale = _cale_membru(run_dir, entity["uid"])
+    cale.parent.mkdir(parents=True, exist_ok=True)
+    cale.write_text(json.dumps(entity, ensure_ascii=False), encoding="utf-8")
+
+
+def _incarca_membru(run_dir, uid: str) -> dict:
+    import json
+
+    return json.loads(_cale_membru(run_dir, uid).read_text(encoding="utf-8"))
+
+
 def _fetch_lista_cdep(fetcher, url, robust: bool):
     """Fetch + parse a cdep chamber list. Under load cdep serves an HTTP-200
     placeholder that parses to zero members (an empty chamber is never real).
@@ -516,8 +538,8 @@ def ruleaza(fetcher, out_dir, leg: int = 2024, client="auto",
     if a key is present, None disables refinement (still a valid build).
     """
     import datetime
-    import shutil
-    import tempfile
+    import json
+    from pathlib import Path
 
     from scrapers import receipt as R
     from scrapers.circumscriptii import CIRCUMSCRIPTII
@@ -539,10 +561,11 @@ def ruleaza(fetcher, out_dir, leg: int = 2024, client="auto",
         rec = R.incarca(run_dir)
         if not rec or rec.get("data") != azi:
             log.warning("continue: fara receipt pentru azi (%s) — nimic de continuat", azi)
-            return raport([])
+            return {"circumscriptii": [], "incomplet": []}
         rec["attempts"] = rec.get("attempts", 1) + 1
         de_reluat = R.incompleti(rec)
-        log.info("continue: attempt %d, %d membri de reluat", rec["attempts"], len(de_reluat))
+        log.info("continue: attempt %d — %d membri scrapati dar fara stage 2; "
+                 "cei nescrapati inca se iau acum", rec["attempts"], len(de_reluat))
     elif mod == "all":
         rec = None  # force-everything escape hatch — ignores + writes no receipt
         de_reluat = None
@@ -559,8 +582,13 @@ def ruleaza(fetcher, out_dir, leg: int = 2024, client="auto",
     else:
         precedent = base
 
-    texte_dir = tempfile.mkdtemp(prefix="demnitari_profil_")
-    logo_urls: dict = {}  # {formatiune -> cdep sigil URL}, for the sigil manifest
+    # store per-membru in run/ (persistent, NU tmp): textele pt LLM + logo-urile.
+    # Nu se curata la interrupt -> ce s-a scrapat ramane, `--continue` reia.
+    texte_dir = Path(run_dir) / "texte"
+    texte_dir.mkdir(parents=True, exist_ok=True)
+    logos_path = Path(run_dir) / "logos.json"
+    logo_urls: dict = (json.loads(logos_path.read_text(encoding="utf-8"))
+                       if mod == "continue" and logos_path.exists() else {})
 
     robust = mod != "all"  # daily/continue self-heal on empty lists; --all fails fast
     log.info("faza 1/4: listele")
@@ -588,62 +616,68 @@ def ruleaza(fetcher, out_dir, leg: int = 2024, client="auto",
         return f"{m.group(1) if m else '?'}:{e['idm']}"
 
     def _reia(e):
-        """On continue, reuse a done member from the last publish (no fetch)."""
-        return mod == "continue" and _uid_de(e) not in de_reluat and _uid_de(e) in base
+        """On continue: skip fetch for a member already scraped (in run/membri)."""
+        return mod == "continue" and _cale_membru(run_dir, _uid_de(e)).exists()
+
+    def _dupa_scrape(ent):
+        # persistenta incrementala: entitate + logos + receipt, pe loc, ca un
+        # interrupt sa nu piarda nimic (fara cleanup)
+        _persist_membru(run_dir, ent)
+        logos_path.write_text(json.dumps(logo_urls, ensure_ascii=False), encoding="utf-8")
+        if rec is not None:
+            R.marcheaza(rec, ent["uid"], s1=True)
+            R.salveaza(run_dir, rec)
 
     log.info("faza 2/5: scrape mecanic (profiluri + CV-uri + biografii)")
     circumscriptii = []
-    try:
-        for circ in CIRCUMSCRIPTII:
-            deputati = []
-            for e in dep_de_circ.get(circ["nr"], []):
-                if _reia(e):
-                    deputati.append(base[_uid_de(e)])
-                    continue
-                try:
-                    ent = _membru_complet(
-                        fetcher, e, bio=None, texte_dir=texte_dir, logo_urls=logo_urls)
-                except Exception:
-                    log.error("esec la deputatul %s (%s)", e["nume_complet"], e["profil_url"])
-                    raise
-                deputati.append(ent)
-                if rec is not None:
-                    R.marcheaza(rec, ent["uid"], s1=True)
+    for circ in CIRCUMSCRIPTII:
+        deputati = []
+        for e in dep_de_circ.get(circ["nr"], []):
+            if _reia(e):
+                deputati.append(_incarca_membru(run_dir, _uid_de(e)))
                 _tick(e["nume_complet"])
-            senatori = []
-            for e in sen_de_circ.get(circ["nr"], []):
-                if _reia(e):
-                    senatori.append(base[_uid_de(e)])
-                    continue
-                try:
-                    fisa_url = SENAT_FISA_URL.format(guid=guid_pentru_idm[e["idm"]])
-                    fields = extract_postback_fields(fetcher.get(fisa_url).text)
-                    bio = parse_biografie(fetcher.post(fisa_url, data=fields).text)
-                    ent = _membru_complet(
-                        fetcher, e, bio=bio, texte_dir=texte_dir, logo_urls=logo_urls)
-                except Exception:
-                    log.error("esec la senatorul %s (%s)", e["nume_complet"], e["profil_url"])
-                    raise
-                senatori.append(ent)
-                if rec is not None:
-                    R.marcheaza(rec, ent["uid"], s1=True)
+                continue
+            try:
+                ent = _membru_complet(
+                    fetcher, e, bio=None, texte_dir=texte_dir, logo_urls=logo_urls)
+            except Exception:
+                log.error("esec la deputatul %s (%s)", e["nume_complet"], e["profil_url"])
+                raise
+            deputati.append(ent)
+            _dupa_scrape(ent)
+            _tick(e["nume_complet"])
+        senatori = []
+        for e in sen_de_circ.get(circ["nr"], []):
+            if _reia(e):
+                senatori.append(_incarca_membru(run_dir, _uid_de(e)))
                 _tick(e["nume_complet"])
-            circumscriptii.append({**circ, "deputati": deputati, "senatori": senatori})
+                continue
+            try:
+                fisa_url = SENAT_FISA_URL.format(guid=guid_pentru_idm[e["idm"]])
+                fields = extract_postback_fields(fetcher.get(fisa_url).text)
+                bio = parse_biografie(fetcher.post(fisa_url, data=fields).text)
+                ent = _membru_complet(
+                    fetcher, e, bio=bio, texte_dir=texte_dir, logo_urls=logo_urls)
+            except Exception:
+                log.error("esec la senatorul %s (%s)", e["nume_complet"], e["profil_url"])
+                raise
+            senatori.append(ent)
+            _dupa_scrape(ent)
+            _tick(e["nume_complet"])
+        circumscriptii.append({**circ, "deputati": deputati, "senatori": senatori})
 
-        log.info("faza 3/5: rafinare LLM (batch)")
-        cereri, esuati = rafineaza_stage2(circumscriptii, texte_dir, client, precedent)
-        log.info("stage 2: %d cereri LLM (%d esuati)", cereri, len(esuati))
-    finally:
-        shutil.rmtree(texte_dir, ignore_errors=True)  # curata textele de profil
+    log.info("faza 3/5: rafinare LLM (batch)")
+    cereri, esuati = rafineaza_stage2(circumscriptii, texte_dir, client, precedent)
+    log.info("stage 2: %d cereri LLM (%d esuati)", cereri, len(esuati))
 
     # stage2 done for everyone whose batch didn't fail (cache hits + successes)
     if rec is not None:
         for m in (x for c in circumscriptii for x in c["deputati"] + c["senatori"]):
             R.marcheaza(rec, m["uid"], s2=(m["uid"] not in esuati))
 
-    log.info("faza 4/5: validare")
-    valideaza(circumscriptii)
-    log.info("faza 5/5: scriere JSON + sigle in %s", out_dir)
+    # validarea (valideaza) e un pas SEPARAT, in seama apelantului (__main__) —
+    # ruleaza doar buildeaza + scrie. Deploy-ul e gatuit de validare oricum.
+    log.info("faza 4/4: scriere JSON + sigle in %s", out_dir)
     scrie_json(
         circumscriptii,
         out_dir,
@@ -666,9 +700,7 @@ def ruleaza(fetcher, out_dir, leg: int = 2024, client="auto",
                     len(lipsa))
     else:
         log.info("COMPLET: toti membrii au trecut stage1+stage2")
-    rap = raport(circumscriptii)
-    rap["_incomplet"] = sorted(lipsa)  # __main__ turns this into the exit code
-    return rap
+    return {"circumscriptii": circumscriptii, "incomplet": sorted(lipsa)}
 
 
 def _acoperire(membri: list[dict]) -> dict:

@@ -51,6 +51,10 @@ jobs:
       # scrape doar la cron / manual / prima data (cache gol); push-ul de cod
       # refoloseste datele restaurate. Sursele (cdep/senat) blocheaza IP-urile
       # de datacenter ale runnerului -> scrapem printr-un tunel WireGuard (exit RO).
+      - name: Install scrape deps
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.date.outputs.cache-matched-key == ''
+        run: sudo apt-get update && sudo apt-get install -y wireguard-tools just
+
       - name: Scrape
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.date.outputs.cache-matched-key == ''
         env:
@@ -59,7 +63,6 @@ jobs:
         run: |
           set +e
           # --- tunel WireGuard (doar pt scrape; build/deploy raman directe) ---
-          sudo apt-get update && sudo apt-get install -y wireguard-tools
           # DNS-ul din config: il setam manual (runnerul foloseste un DNS intern
           # Azure, inaccesibil prin tunel); il scoatem din .conf ca wg-quick sa nu
           # ceara resolvconf (lipsa pe Ubuntu 24.04)
@@ -72,13 +75,13 @@ jobs:
           sudo rm -f /etc/resolv.conf
           echo "nameserver ${DNS:-1.1.1.1}" | sudo tee /etc/resolv.conf >/dev/null
           # --- scrape (cu retry pe 503) ---
-          uv run python -m scrapers; code=$?
+          just scrape; code=$?
           n=0
           while [ "$code" -eq 2 ] && [ "$n" -lt 3 ]; do
             n=$((n + 1))
             echo "::warning::scrape incomplet (503?), retry $n dupa 2 min"
             sleep 120
-            uv run python -m scrapers --continue; code=$?
+            just scrape --continue; code=$?
           done
           if [ "$code" -eq 1 ]; then
             echo "::error::scrape esuat definitiv — nu publicam"

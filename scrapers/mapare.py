@@ -14,8 +14,11 @@ than publish a wrong join.
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
+
+log = logging.getLogger("demnitari.mapare")
 
 
 def _norm_tokens(nume: str) -> frozenset[str]:
@@ -53,5 +56,7 @@ def mapeaza_senatori(cdep_lista: list[dict], senat_lista: list[dict]) -> dict[in
         del ramas[candidati[0]]
 
     if ramas:
-        raise ValueError(f"{len(ramas)} senatori de pe senat.ro nemapati: {list(ramas)[:3]}")
+        # senat.ro are senatori care nu-s in lista cdep (lista cdep incompleta) —
+        # e validare, nu build: logam; valideaza/MIN_SENATORI gatuie o lista prea mica
+        log.warning("%d senatori de pe senat.ro nemapati: %s", len(ramas), list(ramas)[:3])
     return mapare

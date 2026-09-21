@@ -40,7 +40,7 @@ class Fetcher:
             time.sleep(de_asteptat)
         self._last = time.monotonic()
 
-    def _cu_retry(self, fa_request, url: str):
+    def _cu_retry(self, fa_request, url: str, metoda: str = "GET"):
         ultima_eroare: Exception | None = None
         for incercare in range(self.retries):
             self._politete()
@@ -48,6 +48,8 @@ class Fetcher:
                 self.stats["requests"] += 1
                 resp = fa_request()
                 resp.raise_for_status()
+                # fiecare request (nivel DEBUG -> in logfile; pe consola doar cu --stdout)
+                log.debug("%s %s -> %d (%d octeti)", metoda, url, resp.status_code, len(resp.content))
                 return resp
             except Exception as e:  # retry pe orice: HTTP >= 400, timeout, DNS
                 ultima_eroare = e
@@ -59,7 +61,7 @@ class Fetcher:
         raise ultima_eroare
 
     def get(self, url: str, **kw):
-        return self._cu_retry(lambda: self._session_get(url, **kw), url)
+        return self._cu_retry(lambda: self._session_get(url, **kw), url, "GET")
 
     def post(self, url: str, data: dict, **kw):
-        return self._cu_retry(lambda: self._session_post(url, data, **kw), url)
+        return self._cu_retry(lambda: self._session_post(url, data, **kw), url, "POST")

@@ -14,22 +14,10 @@ fetch-addresses:
 test *args:
     uv run pytest {{args}}
 
+# sterge starea de scrape (run/) + datele generate; pastreaza localitati.json (versionat)
+clean:
+    rm -rf run/ site/data/parlamentari site/data/sigle site/data/meta.json
+
 # dev server pentru frontend (Vite)
 serve:
     cd site && npm run dev
-
-# urca schimbarile: intai datele din submodul (daca exista), apoi codul +
-# bump-ul de pointer. Push pe master -> GitHub Actions publica pe Pages.
-# Ex: `just deploy "fix autocomplete"` (mesaj optional).
-# (scrape-ul de date NU se declanseaza de aici - pe ala il ruleaza cronul zilnic)
-deploy mesaj="update":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ -n "$(git -C site/data status --porcelain)" ]; then
-        git -C site/data add -A
-        git -C site/data commit -m "data: {{mesaj}} ($(date +%F))"
-        git -C site/data push origin HEAD:master
-    fi
-    git add -A
-    git commit -m "{{mesaj}}" || echo "(nimic de comis in codul aplicatiei)"
-    git push origin master
