@@ -10,6 +10,10 @@ scrape *args:
 fetch-addresses:
     uv run python -m scrapers.localitati
 
+# ruleaza testele (pytest, offline cu fixtures)
+test *args:
+    uv run pytest {{args}}
+
 # dev server pentru frontend (Vite)
 serve:
     cd site && npm run dev

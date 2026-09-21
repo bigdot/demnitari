@@ -32,6 +32,11 @@
   async function alege(loc) {
     selectata = loc
     location.hash = String(loc.siruta)
+    // analytics: path = hash-ul (unic/siruta), title citibil pt filtrare
+    window.goatcounter?.count?.({
+      path: location.pathname + location.hash,
+      title: `${loc.nume} (${loc.judet})`,
+    })
     eroare = null
     date = null
     seIncarca = true

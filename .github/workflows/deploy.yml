@@ -1,0 +1,97 @@
+name: Deploy
+
+# Publica pe GitHub Pages din master. Cronul re-scrapeaza datele zilnic; un push
+# de cod refoloseste ultimul scrape din cache (deploy rapid, fara re-scrape).
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "0 5 * * *" # zilnic ~08:00 RO (05:00 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# un singur deploy odata; nu anulam unul in curs
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - run: uv sync
+
+      # datele scrapate (site/data) se pastreaza intre rulari, cheie unica pe
+      # rulare + restore pe prefix -> restaureaza ultimul scrape disponibil
+      - name: Restore date
+        id: date
+        uses: actions/cache/restore@v4
+        with:
+          path: site/data
+          key: date-${{ github.run_id }}
+          restore-keys: date-
+
+      # scrape doar la cron / manual / prima data (cache gol); push-ul de cod
+      # refoloseste datele restaurate
+      - name: Scrape
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.date.outputs.cache-matched-key == ''
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set +e
+          uv run python -m scrapers.localitati || exit 1
+          uv run python -m scrapers; code=$?
+          n=0
+          while [ "$code" -eq 2 ] && [ "$n" -lt 3 ]; do
+            n=$((n + 1))
+            echo "::warning::scrape incomplet (503?), retry $n dupa 2 min"
+            sleep 120
+            uv run python -m scrapers --continue; code=$?
+          done
+          if [ "$code" -eq 1 ]; then
+            echo "::error::scrape esuat definitiv — nu publicam"
+            exit 1
+          fi
+          exit 0  # code 0 (complet) sau 2 (partial, dar baseline mecanic valid)
+
+      - name: Save date
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.date.outputs.cache-matched-key == ''
+        uses: actions/cache/save@v4
+        with:
+          path: site/data
+          key: date-${{ github.run_id }}
+
+      - name: Build
+        run: |
+          cd site
+          npm ci
+          npm run build
+          echo demnitari.ro > dist/CNAME  # tine domeniul custom intre deploy-uri
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
