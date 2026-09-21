@@ -13,4 +13,7 @@ tmp/
 run/
 
 # generated data (scraped in CI + built into the Pages artifact; not versioned)
-site/data/
+# EXCEPTIE: localitati.json (nomenclator SIRUTA, tabel de referinta) e versionat —
+# data.gov.ro blocheaza IP-ul runnerului GitHub, deci CI nu-l poate descarca
+site/data/*
+!site/data/localitati.json
